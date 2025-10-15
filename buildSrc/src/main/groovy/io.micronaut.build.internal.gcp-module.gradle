@@ -2,11 +2,6 @@ plugins {
     id("io.micronaut.build.internal.gcp-base")
     id("io.micronaut.build.internal.module")
 }
-ossIndexAudit {
-    excludeCoordinates = [
-            "org.threeten:threetenbp:1.7.2", // no version patched https://ossindex.sonatype.org/component/pkg:maven/org.threeten/threetenbp
-    ]
-}
 
 tasks.named("japiCmp") { t ->
     t.enabled = false
