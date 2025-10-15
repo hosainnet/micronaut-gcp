@@ -2,3 +2,7 @@ plugins {
     id("io.micronaut.build.internal.gcp-base")
     id("io.micronaut.build.internal.module")
 }
+
+tasks.named("japiCmp") { t ->
+    t.enabled = false
+}

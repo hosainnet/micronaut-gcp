@@ -23,6 +23,7 @@ import io.micronaut.core.convert.ConversionService;
 import io.micronaut.core.convert.value.MutableConvertibleValues;
 import io.micronaut.core.convert.value.MutableConvertibleValuesMap;
 import io.micronaut.core.execution.ExecutionFlow;
+import io.micronaut.core.io.buffer.ByteArrayBufferFactory;
 import io.micronaut.core.io.buffer.ByteBuffer;
 import io.micronaut.core.type.Argument;
 import io.micronaut.core.util.ArgumentUtils;
@@ -36,6 +37,11 @@ import io.micronaut.http.MediaType;
 import io.micronaut.http.MutableHttpHeaders;
 import io.micronaut.http.MutableHttpParameters;
 import io.micronaut.http.MutableHttpRequest;
+import io.micronaut.http.ServerHttpRequest;
+import io.micronaut.http.body.ByteBody;
+import io.micronaut.http.body.CloseableAvailableByteBody;
+import io.micronaut.http.body.CloseableByteBody;
+import io.micronaut.http.body.stream.InputStreamByteBody;
 import io.micronaut.http.cookie.Cookie;
 import io.micronaut.http.cookie.Cookies;
 import io.micronaut.http.simple.SimpleHttpParameters;
@@ -50,16 +56,21 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.function.Supplier;
 
 import static io.micronaut.servlet.http.BodyBuilder.isFormSubmission;
@@ -75,6 +86,7 @@ import static io.micronaut.servlet.http.BodyBuilder.isFormSubmission;
 final class GoogleFunctionHttpRequest<B> implements
     ServletHttpRequest<com.google.cloud.functions.HttpRequest, B>,
     ServletExchange<com.google.cloud.functions.HttpRequest, com.google.cloud.functions.HttpResponse>,
+    ServerHttpRequest<B>,
     FullHttpRequest<B>,
     ParsedBodyHolder<B> {
 
@@ -85,6 +97,7 @@ final class GoogleFunctionHttpRequest<B> implements
     private final HttpMethod method;
     private final GoogleFunctionHeaders headers;
     private final GoogleFunctionHttpResponse<?> googleResponse;
+    private final Supplier<ByteBody> byteBody;
     private MutableHttpParameters httpParameters;
     private MutableConvertibleValues<Object> attributes;
     private B parsedBody;
@@ -92,8 +105,6 @@ final class GoogleFunctionHttpRequest<B> implements
     private GoogleCookies cookies;
 
     private ConversionService conversionService;
-
-    private ByteArrayByteBuffer<B> servletByteBuffer;
 
     /**
      * Default constructor.
@@ -107,7 +118,8 @@ final class GoogleFunctionHttpRequest<B> implements
         com.google.cloud.functions.HttpRequest googleRequest,
         GoogleFunctionHttpResponse<?> googleResponse,
         ConversionService conversionService,
-        BodyBuilder bodyBuilder) {
+        BodyBuilder bodyBuilder,
+        Executor ioExecutor) {
         this.googleRequest = googleRequest;
         this.googleResponse = googleResponse;
         this.uri = URI.create(googleRequest.getUri());
@@ -125,20 +137,44 @@ final class GoogleFunctionHttpRequest<B> implements
             B built = parsedBody != null ? parsedBody :  (B) bodyBuilder.buildBody(this::getInputStream, this);
             return Optional.ofNullable(built);
         });
+        this.byteBody = SupplierUtil.memoized(() -> {
+            try {
+                return InputStreamByteBody.create(
+                    googleRequest.getInputStream(),
+                    OptionalLong.of(googleRequest.getContentLength()),
+                    ioExecutor,
+                    ByteArrayBufferFactory.INSTANCE
+                );
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
     }
 
     public byte[] getBodyBytes() throws IOException {
-        return googleRequest.getInputStream().readAllBytes();
+        try (CloseableByteBody streaming = byteBody().split(ByteBody.SplitBackpressureMode.FASTEST);
+             CloseableAvailableByteBody buffered = streaming.buffer().get()) {
+            return buffered.toByteArray();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new InterruptedIOException();
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof IOException ioe) {
+                throw ioe;
+            } else {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
     @Override
     public InputStream getInputStream() throws IOException {
-        return servletByteBuffer != null ? servletByteBuffer.toInputStream() : new ByteArrayInputStream(getBodyBytes());
+        return byteBody().split(ByteBody.SplitBackpressureMode.FASTEST).toInputStream();
     }
 
     @Override
     public BufferedReader getReader() throws IOException {
-        return googleRequest.getReader();
+        return new BufferedReader(new InputStreamReader(getInputStream(), getCharacterEncoding()));
     }
 
     @Override
@@ -263,10 +299,7 @@ final class GoogleFunctionHttpRequest<B> implements
     @Override
     public @Nullable ByteBuffer<?> contents() {
         try {
-            if (servletByteBuffer == null) {
-                this.servletByteBuffer = new ByteArrayByteBuffer<>(getInputStream().readAllBytes());
-            }
-            return servletByteBuffer;
+            return new ByteArrayByteBuffer<>(getBodyBytes());
         } catch (IOException e) {
             throw new IllegalStateException("Error getting all body contents", e);
         }
@@ -275,6 +308,11 @@ final class GoogleFunctionHttpRequest<B> implements
     @Override
     public @Nullable ExecutionFlow<ByteBuffer<?>> bufferContents() {
         return ExecutionFlow.just(contents());
+    }
+
+    @Override
+    public @NonNull ByteBody byteBody() {
+        return byteBody.get();
     }
 
     /**
